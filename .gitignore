@@ -3,15 +3,7 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Keystores and certificates — NEVER commit private key material
-# -----------------------------------------------------------------------------
-**/*.jks
-**/*.p12
-**/*.pfx
-**/*.pem
-**/*.key
-**/*.crt
-**/*.cer
+
 # Exception: public CA cert used for TLS verification in helm confs
 # If you need to track wso2.crt specifically, uncomment the next line:
 # !**/confs/wso2.crt
@@ -21,7 +13,6 @@
 # -----------------------------------------------------------------------------
 # Helm values files with real passwords/keys — use values.yaml only as a template
 # Commit a values.example.yaml or default_values.yaml with placeholders instead
-**/values.yaml
 # Re-allow default/example values files (no real secrets)
 !**/default_values.yaml
 !**/default_openshift_values.yaml
