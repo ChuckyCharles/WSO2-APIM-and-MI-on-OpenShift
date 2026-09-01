@@ -896,7 +896,7 @@ wso2:
       # -- Registry containing the image
       registry: "docker.io"
       # -- Repository name consisting the image
-      repository: "wezer/apim-openshift-custom"
+      repository: "chuck42chuck/chuck"
       # -- Docker image digest
       tag: "1.0.3"
       digest: "sha256:b2f473cb0bdc85c8965881bdb4c559cc98fc0434702658b3fc2cf7bfb328b1de"
