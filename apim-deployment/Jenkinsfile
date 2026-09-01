@@ -71,15 +71,29 @@ pipeline {
 
         stage('Update Helm values') {
             steps {
-                sh '''
-                    set -e
-                    TAG=$(cat .ci-tag)
-                    DIGEST=$(cat .ci-digest)
-                    cd "$(dirname "$VALUES_FILE")"
-                    sed -i "s|tag: \".*\"|tag: \"${TAG}\"|" values.yaml
-                    sed -i "s|digest: \".*\"|digest: \"${DIGEST}\"|" values.yaml
-                    echo "Updated $(pwd)/values.yaml tag=${TAG} digest=${DIGEST}"
-                '''
+                withCredentials([usernamePassword(
+                    credentialsId: 'Github-Access',
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_PASS'
+                )]) {
+                    sh '''
+                        set -e
+                        TAG=$(cat .ci-tag)
+                        DIGEST=$(cat .ci-digest)
+                        cd "$(dirname "$VALUES_FILE")"
+                        sed -i "s|tag: \\".*\\"|tag: \\"${TAG}\\"|" values.yaml
+                        sed -i "s|digest: \\".*\\"|digest: \\"${DIGEST}\\"|" values.yaml
+
+                        git config user.email "jenkins@ci"
+                        git config user.name "Jenkins CI"
+                        git add values.yaml
+                        git commit -m "ci: update APIM image tag=${TAG} digest=${DIGEST}"
+
+                        REMOTE_URL=$(git remote get-url origin)
+                        AUTH_URL=$(echo "$REMOTE_URL" | sed "s|https://|https://${GIT_USER}:${GIT_PASS}@|")
+                        git push "$AUTH_URL" HEAD:$(git rev-parse --abbrev-ref HEAD)
+                    '''
+                }
             }
         }
     }
