@@ -1,0 +1,76 @@
+pipeline {
+    agent any
+
+    environment {
+        // Username/password credential in Jenkins for the container registry
+        REGISTRY_CREDENTIALS = 'docker-registry'
+    }
+
+    stages {
+        stage('Find Dockerfile') {
+            steps {
+                script {
+                    env.DOCKERFILE = sh(
+                        script: '''
+                            set -e
+                            FILE=$(find . -type d -name mi-deployment -prune -o -name Dockerfile -print | head -n 1)
+                            if [ -z "$FILE" ]; then
+                                echo "No Dockerfile found" >&2
+                                exit 1
+                            fi
+                            echo "$FILE"
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    env.DOCKER_DIR = env.DOCKERFILE.replaceAll('/Dockerfile$', '')
+                    env.VALUES_FILE = "${env.DOCKER_DIR}/../helm-apim/all-in-one/values.yaml"
+                    echo "Dockerfile: ${env.DOCKERFILE}"
+                    echo "Build context: ${env.DOCKER_DIR}"
+                    echo "Helm values: ${env.VALUES_FILE}"
+                }
+            }
+        }
+
+        stage('Build and Push') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: env.REGISTRY_CREDENTIALS,
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        set -e
+                        REGISTRY=$(grep -E '^[[:space:]]+registry:' "$VALUES_FILE" | head -n 1 | cut -d'"' -f2)
+                        REPOSITORY=$(grep -E '^[[:space:]]+repository:' "$VALUES_FILE" | head -n 1 | cut -d'"' -f2)
+                        IMAGE="${REGISTRY}/${REPOSITORY}"
+                        TAG="${BUILD_NUMBER}"
+
+                        echo "$DOCKER_PASS" | docker login "$REGISTRY" -u "$DOCKER_USER" --password-stdin
+                        docker build -t "${IMAGE}:${TAG}" -f "${DOCKERFILE}" "${DOCKER_DIR}"
+                        docker push "${IMAGE}:${TAG}"
+                        docker pull "${IMAGE}:${TAG}"
+                        DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${TAG}" | cut -d@ -f2)
+
+                        echo "${IMAGE}" > .ci-image
+                        echo "${TAG}" > .ci-tag
+                        echo "${DIGEST}" > .ci-digest
+                    '''
+                }
+            }
+        }
+
+        stage('Update Helm values') {
+            steps {
+                sh '''
+                    set -e
+                    TAG=$(cat .ci-tag)
+                    DIGEST=$(cat .ci-digest)
+                    cd "$(dirname "$VALUES_FILE")"
+                    sed -i "s|tag: \".*\"|tag: \"${TAG}\"|" values.yaml
+                    sed -i "s|digest: \".*\"|digest: \"${DIGEST}\"|" values.yaml
+                    echo "Updated $(pwd)/values.yaml tag=${TAG} digest=${DIGEST}"
+                '''
+            }
+        }
+    }
+}
