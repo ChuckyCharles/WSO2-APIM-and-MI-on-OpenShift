@@ -1,12 +1,22 @@
 pipeline {
     agent any
 
+    options {
+        skipDefaultCheckout()
+    }
+
     environment {
         // Username/password credential in Jenkins for the container registry
         REGISTRY_CREDENTIALS = 'docker-registry'
     }
 
     stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
         stage('Find Dockerfile') {
             steps {
                 script {
