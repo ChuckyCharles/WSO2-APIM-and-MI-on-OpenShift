@@ -12,11 +12,11 @@ pipeline {
         // Artifactory configuration
         ARTIFACTORY_SERVER_ID = 'artifactory-server'
         ARTIFACTORY_DOCKER_CREDS = 'artifactory-docker'
-        ARTIFACTORY_URL = 'http://100.117.18.88:8082'
+        ARTIFACTORY_URL = 'https://charley.jfrog.io'
         ARTIFACTORY_DOCKER_REPO = 'wso2-apim-docker-local'
         ARTIFACTORY_HELM_REPO = 'wso2-apim-helm-local'
         ARTIFACTORY_GENERIC_REPO = 'wso2-apim-generic-local'
-        ARTIFACTORY_DOCKER_REGISTRY = '100.117.18.88:8082'
+        ARTIFACTORY_DOCKER_REGISTRY = 'charley.jfrog.io'
     }
 
     stages {
@@ -107,6 +107,9 @@ pipeline {
                             set -e
                             IMAGE=\$(cat .ci-image)
                             
+                            # Ensure insecure registry is recognized for this build
+                            export DOCKER_CONTENT_TRUST=0
+                            
                             # Login to Artifactory Docker registry
                             echo "\$ART_PASS" | docker login ${env.ARTIFACTORY_DOCKER_REGISTRY} -u "\$ART_USER" --password-stdin
                             
@@ -114,7 +117,7 @@ pipeline {
                             docker tag "\${IMAGE}:${TAG}" "${env.ARTIFACTORY_DOCKER_REGISTRY}/${env.ARTIFACTORY_DOCKER_REPO}/wso2am-custom:${TAG}"
                             docker tag "\${IMAGE}:${TAG}" "${env.ARTIFACTORY_DOCKER_REGISTRY}/${env.ARTIFACTORY_DOCKER_REPO}/wso2am-custom:latest"
                             
-                            # Push to Artifactory
+                            # Push to Artifactory (Docker will use HTTP based on daemon.json insecure-registries)
                             docker push "${env.ARTIFACTORY_DOCKER_REGISTRY}/${env.ARTIFACTORY_DOCKER_REPO}/wso2am-custom:${TAG}"
                             docker push "${env.ARTIFACTORY_DOCKER_REGISTRY}/${env.ARTIFACTORY_DOCKER_REPO}/wso2am-custom:latest"
                         """
