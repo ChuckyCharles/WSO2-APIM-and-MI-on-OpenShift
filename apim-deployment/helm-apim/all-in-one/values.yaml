@@ -898,8 +898,8 @@ wso2:
       # -- Repository name consisting the image
       repository: "chuck42chuck/chuck"
       # -- Docker image digest
-      tag: "1.01"
-      digest: "sha256:a6a7083169dcf208e4622434215eee928cec16907c5866b26413e105c0bb24fe"
+      tag: "1.04"
+      digest: "sha256:3afc2251fde381a4fd15ff6bda05209e86ab0682fcaef9577d86bf47571bceb9"
       # -- Refer to the Kubernetes documentation on updating images (https://kubernetes.io/docs/concepts/containers/images/#updating-images)
       imagePullPolicy: IfNotPresent
 
