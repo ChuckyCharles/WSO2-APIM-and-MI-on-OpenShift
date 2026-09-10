@@ -124,24 +124,32 @@ pipeline {
                     }
                     
                     // 2. Package and push Helm chart
-                    sh """
-                        set -e
-                        cd "${env.DOCKER_DIR}/../helm-apim/all-in-one"
-                        
-                        # Update Chart.yaml version to match build tag
-                        sed -i "s|^version:.*|version: ${TAG}|" Chart.yaml
-                        
-                        # Package the chart
-                        helm package .
-                        
-                        CHART_FILE=\$(ls wso2am-all-in-one-*.tgz | head -n 1)
-                        echo "Packaged chart: \${CHART_FILE}"
-                        
-                        # Upload to Artifactory using curl
-                        curl -u "\${ART_USER}:\${ART_PASS}" \
-                            -T "\${CHART_FILE}" \
-                            "${env.ARTIFACTORY_URL}/artifactory/${env.ARTIFACTORY_HELM_REPO}/\${CHART_FILE}"
-                    """
+                    withCredentials([usernamePassword(
+                        credentialsId: env.ARTIFACTORY_DOCKER_CREDS,
+                        usernameVariable: 'ART_USER',
+                        passwordVariable: 'ART_PASS'
+                    )]) {
+                        sh """
+                            set -e
+                            cd "${env.DOCKER_DIR}/../helm-apim/all-in-one"
+                            
+                            # Update Chart.yaml version to match build tag
+                            sed -i "s|^version:.*|version: ${TAG}|" Chart.yaml
+                            
+                            # Package the chart
+                            helm package .
+                            
+                            CHART_FILE=\$(ls wso2am-all-in-one-*.tgz | head -n 1)
+                            echo "Packaged chart: \${CHART_FILE}"
+                            
+                            # Upload to Artifactory using curl (-f = fail on HTTP errors)
+                            curl -f -u "\${ART_USER}:\${ART_PASS}" \
+                                -T "\${CHART_FILE}" \
+                                "${env.ARTIFACTORY_URL}/artifactory/${env.ARTIFACTORY_HELM_REPO}/\${CHART_FILE}"
+                            
+                            echo "✅ Helm chart uploaded successfully"
+                        """
+                    }
                     
                     // 3. Upload DB scripts to Artifactory
                     withCredentials([usernamePassword(
@@ -152,17 +160,20 @@ pipeline {
                         sh """
                             set -e
                             
-                            # Upload apimgt DB script
-                            curl -u "\${ART_USER}:\${ART_PASS}" \
+                            # Upload apimgt DB script (-f = fail on HTTP errors)
+                            curl -f -u "\${ART_USER}:\${ART_PASS}" \
                                 -T "${env.DOCKER_DIR}/db-scripts/apimgt/mysql.sql" \
                                 "${env.ARTIFACTORY_URL}/artifactory/${env.ARTIFACTORY_GENERIC_REPO}/wso2-apim/${TAG}/db-scripts/apimgt/mysql.sql"
                             
+                            echo "✅ apimgt DB script uploaded"
+                            
                             # Upload shareddb DB script
-                            curl -u "\${ART_USER}:\${ART_PASS}" \
+                            curl -f -u "\${ART_USER}:\${ART_PASS}" \
                                 -T "${env.DOCKER_DIR}/db-scripts/shareddb/mysql.sql" \
                                 "${env.ARTIFACTORY_URL}/artifactory/${env.ARTIFACTORY_GENERIC_REPO}/wso2-apim/${TAG}/db-scripts/shareddb/mysql.sql"
                             
-                            echo "Successfully published all artifacts to Artifactory"
+                            echo "✅ shareddb DB script uploaded"
+                            echo "✅ Successfully published all artifacts to Artifactory"
                         """
                     }
                     
