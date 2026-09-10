@@ -8,6 +8,15 @@ pipeline {
     environment {
         // Username/password credential in Jenkins for the container registry
         REGISTRY_CREDENTIALS = 'docker-registry'
+        
+        // Artifactory configuration
+        ARTIFACTORY_SERVER_ID = 'artifactory-server'
+        ARTIFACTORY_DOCKER_CREDS = 'artifactory-docker'
+        ARTIFACTORY_URL = 'http://100.117.18.88:8082'
+        ARTIFACTORY_DOCKER_REPO = 'wso2-apim-docker-local'
+        ARTIFACTORY_HELM_REPO = 'wso2-apim-helm-local'
+        ARTIFACTORY_GENERIC_REPO = 'wso2-apim-generic-local'
+        ARTIFACTORY_DOCKER_REGISTRY = '100.117.18.88:8082'
     }
 
     stages {
@@ -78,6 +87,88 @@ pipeline {
                         echo "${TAG}" > .ci-tag
                         echo "${DIGEST}" > .ci-digest
                     '''
+                }
+            }
+        }
+
+        stage('Publish to Artifactory') {
+            steps {
+                script {
+                    def server = Artifactory.server env.ARTIFACTORY_SERVER_ID
+                    def TAG = sh(script: 'cat .ci-tag', returnStdout: true).trim()
+                    
+                    // 1. Push Docker image to Artifactory
+                    withCredentials([usernamePassword(
+                        credentialsId: env.ARTIFACTORY_DOCKER_CREDS,
+                        usernameVariable: 'ART_USER',
+                        passwordVariable: 'ART_PASS'
+                    )]) {
+                        sh """
+                            set -e
+                            IMAGE=\$(cat .ci-image)
+                            
+                            # Login to Artifactory Docker registry
+                            echo "\$ART_PASS" | docker login ${env.ARTIFACTORY_DOCKER_REGISTRY} -u "\$ART_USER" --password-stdin
+                            
+                            # Tag for Artifactory
+                            docker tag "\${IMAGE}:${TAG}" "${env.ARTIFACTORY_DOCKER_REGISTRY}/${env.ARTIFACTORY_DOCKER_REPO}/wso2am-custom:${TAG}"
+                            docker tag "\${IMAGE}:${TAG}" "${env.ARTIFACTORY_DOCKER_REGISTRY}/${env.ARTIFACTORY_DOCKER_REPO}/wso2am-custom:latest"
+                            
+                            # Push to Artifactory
+                            docker push "${env.ARTIFACTORY_DOCKER_REGISTRY}/${env.ARTIFACTORY_DOCKER_REPO}/wso2am-custom:${TAG}"
+                            docker push "${env.ARTIFACTORY_DOCKER_REGISTRY}/${env.ARTIFACTORY_DOCKER_REPO}/wso2am-custom:latest"
+                        """
+                    }
+                    
+                    // 2. Package and push Helm chart
+                    sh """
+                        set -e
+                        cd "${env.DOCKER_DIR}/../helm-apim/all-in-one"
+                        
+                        # Update Chart.yaml version to match build tag
+                        sed -i "s|^version:.*|version: ${TAG}|" Chart.yaml
+                        
+                        # Package the chart
+                        helm package .
+                        
+                        CHART_FILE=\$(ls wso2am-all-in-one-*.tgz | head -n 1)
+                        echo "Packaged chart: \${CHART_FILE}"
+                        
+                        # Upload to Artifactory using curl
+                        curl -u "\${ART_USER}:\${ART_PASS}" \
+                            -T "\${CHART_FILE}" \
+                            "${env.ARTIFACTORY_URL}/artifactory/${env.ARTIFACTORY_HELM_REPO}/\${CHART_FILE}"
+                    """
+                    
+                    // 3. Upload DB scripts to Artifactory
+                    withCredentials([usernamePassword(
+                        credentialsId: env.ARTIFACTORY_DOCKER_CREDS,
+                        usernameVariable: 'ART_USER',
+                        passwordVariable: 'ART_PASS'
+                    )]) {
+                        sh """
+                            set -e
+                            
+                            # Upload apimgt DB script
+                            curl -u "\${ART_USER}:\${ART_PASS}" \
+                                -T "${env.DOCKER_DIR}/db-scripts/apimgt/mysql.sql" \
+                                "${env.ARTIFACTORY_URL}/artifactory/${env.ARTIFACTORY_GENERIC_REPO}/wso2-apim/${TAG}/db-scripts/apimgt/mysql.sql"
+                            
+                            # Upload shareddb DB script
+                            curl -u "\${ART_USER}:\${ART_PASS}" \
+                                -T "${env.DOCKER_DIR}/db-scripts/shareddb/mysql.sql" \
+                                "${env.ARTIFACTORY_URL}/artifactory/${env.ARTIFACTORY_GENERIC_REPO}/wso2-apim/${TAG}/db-scripts/shareddb/mysql.sql"
+                            
+                            echo "Successfully published all artifacts to Artifactory"
+                        """
+                    }
+                    
+                    // 4. Publish build info to Artifactory
+                    def buildInfo = Artifactory.newBuildInfo()
+                    buildInfo.name = "wso2-apim-build"
+                    buildInfo.number = "${TAG}"
+                    buildInfo.env.capture = true
+                    server.publishBuildInfo buildInfo
                 }
             }
         }
