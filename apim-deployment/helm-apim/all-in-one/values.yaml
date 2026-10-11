@@ -894,9 +894,9 @@ wso2:
         username: ""
         password: ""
       # -- Registry containing the image
-      registry: "docker.io"
+      registry: "image-registry.openshift-image-registry.svc:5000"
       # -- Repository name consisting the image
-      repository: "chuck42chuck/chuck"
+      repository: "wso2-ci/wso2am-custom"
       # -- Docker image digest
       tag: "1.05"
       digest: "sha256:7653160b275b0f371aceb73f9cecd71b48b4caf3246fdaeedd1c2329c7bb35f9"
