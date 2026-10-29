@@ -1,0 +1,462 @@
+# =============================================================================
+# WSO2 CI PIPELINE  -  ABSA Alauda Container Platform (Tekton)
+#
+#   git-clone -> build and push to JFrog (Kaniko) -> scan (Trivy) -> update Helm
+#   values (tag + digest) in Git.  The external ArgoCD then detects the Git
+#   change and deploys.  Created from the console (no CLI needed).
+#
+# -----------------------------------------------------------------------------
+# BEFORE YOU APPLY THIS - PREREQUISITES AND VARIABLES TO SET
+# (the values themselves are set in the PipelineRun file, wso2-absa-pipelinerun.yaml)
+#
+# A. Namespace settings (ask the platform team if you cannot change them)
+#    [ ] Pod Security level of the CI/CD namespace = baseline.
+#        The Kaniko build step runs as root; the "restricted" level rejects it.
+#    [ ] A StorageClass name for the shared build volume
+#        (console: Storage > StorageClasses).  Set it in the PipelineRun.
+#    [ ] Network access from the namespace to:
+#          - the ABSA GitHub repo (clone and push)
+#          - JFrog Artifactory (push images, pull for the scan)
+#          - docker.io (base image in the Dockerfile, e.g. wso2/wso2am)
+#          - the Trivy vulnerability database (ghcr.io)
+#        If a proxy or internal CA re-signs HTTPS, provide the CA (item C3).
+#    [ ] The cluster nodes can pull the tool images (git, kaniko, trivy, yq).
+#        If external registries are blocked, copy them to JFrog and change the
+#        git-image / kaniko-image / trivy-image / yq-image parameters.
+#
+# B. Secrets to create in the same namespace (Configuration > Secrets)
+#    B1. registry-auth  (type: Image Registry)
+#          Registry address : <jfrog-host>
+#          Username         : <jfrog user or service account>
+#          Password         : <jfrog access token with DEPLOY on staging-docker>
+#        (a token limited to the staging repo is safer than a user password)
+#    B2. git-auth       (type: Opaque, two keys)
+#          username = <GitHub user>
+#          password = <GitHub token with write access to the ABSA repo>
+#
+# C. Optional
+#    C1. skip-tls-verify : LAB ONLY. Leave "false" at ABSA.
+#    C2. scan-exit-code  : "1" fails the pipeline on findings, "0" report only.
+#    C3. ConfigMap custom-ca with key ca.crt (PEM) if TLS errors say
+#        "x509: certificate signed by unknown authority"; then enable the
+#        ca-bundle workspace in the PipelineRun.
+#
+# D. After the first run
+#    - The pipeline commits the new tag and digest to the Helm values file on
+#      the branch it built from.  If that branch is protected, ask for an
+#      exception for the pipeline user or use a dedicated branch.
+#    - The chart values must already point at the JFrog repo path
+#      (registry/repository), and each target namespace needs a JFrog pull
+#      secret.  The pipeline updates only tag and digest.
+# -----------------------------------------------------------------------------
+# No namespace is set below: it is created in whichever namespace is selected
+# in the console.  All tasks are embedded (no Tekton Hub dependency); tool
+# images are parameters so they can point at an internal mirror.
+# =============================================================================
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: wso2-ci-pipeline
+spec:
+  description: Build a WSO2 APIM / MI image, push it to JFrog Artifactory, scan it, then update the image tag and digest in the GitOps repo.
+
+  params:
+    # --- Source repo ---------------------------------------------------------
+    - name: repo-url
+      type: string
+      description: HTTPS URL of the ABSA GitHub repo that holds the Dockerfiles and Helm charts.
+    - name: revision
+      type: string
+      description: Branch to build from. The Helm values commit is pushed back to this same branch.
+      default: main
+    - name: context-dir
+      type: string
+      description: Build context, relative to the repo root (apim-deployment or mi-deployment).
+      default: apim-deployment/apim
+    - name: dockerfile
+      type: string
+      description: Dockerfile path, relative to context-dir.
+      default: Dockerfile
+
+    # --- Image targets -------------------------------------------------------
+    - name: image-name
+      type: string
+      default: wso2-apim
+    - name: jfrog-repo
+      type: string
+      description: JFrog Artifactory Docker repo path to push to (no scheme, no tag), e.g. <jfrog-host>/staging-docker. The Helm chart must pull from <jfrog-repo>/<image-name>.
+    - name: mirror-repo
+      type: string
+      description: Optional second registry path (e.g. the Alauda internal registry <registry-host>/<project>). Leave empty to push to JFrog only.
+      default: ""
+
+    # --- GitOps update -------------------------------------------------------
+    - name: values-file
+      type: string
+      description: Helm values file to update, relative to the repo root.
+      default: apim-deployment/helm-apim/all-in-one/values.yaml
+    - name: values-image-path
+      type: string
+      description: yq path of the image block in the values file. Both .tag and .digest under it are updated (the charts deploy by digest).
+      default: .wso2.deployment.image
+
+    # --- TLS -----------------------------------------------------------------
+    - name: skip-tls-verify
+      type: string
+      description: LAB ONLY - "true" turns off TLS verification for registry pulls/pushes and the scan. Prefer the ca-bundle workspace.
+      default: "false"
+
+    # --- Scan ----------------------------------------------------------------
+    - name: scan-severity
+      type: string
+      default: HIGH,CRITICAL
+    - name: scan-exit-code
+      type: string
+      description: "1 = fail the pipeline when findings match scan-severity, 0 = report only."
+      default: "1"
+
+    # --- Tool images (pin or mirror as needed) -------------------------------
+    - name: git-image
+      type: string
+      default: docker.io/alpine/git:2.45.2
+    - name: kaniko-image
+      type: string
+      description: Kaniko image. The -debug tag is required because the script step needs a shell. Kaniko is no longer maintained by Google; a maintained fork is ghcr.io/chainguard-dev/kaniko.
+      default: gcr.io/kaniko-project/executor:v1.23.2-debug
+    - name: trivy-image
+      type: string
+      default: docker.io/aquasec/trivy:0.58.0
+    - name: yq-image
+      type: string
+      default: docker.io/mikefarah/yq:4.44.3
+
+  workspaces:
+    - name: source
+    - name: registry-auth
+      description: Secret with key config.json (Docker config JSON) for the registries.
+    - name: git-auth
+      description: Secret with keys username and password for the Git repo.
+    - name: ca-bundle
+      optional: true
+      description: Optional ConfigMap with key ca.crt (PEM) for a CA that signs the network's TLS (proxy or internal registry).
+
+  results:
+    - name: COMMIT
+      type: string
+      value: $(tasks.git-clone.results.commit)
+    - name: IMAGE_DIGEST
+      type: string
+      value: $(tasks.build-and-push.results.IMAGE_DIGEST)
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. Clone
+    # -------------------------------------------------------------------------
+    - name: git-clone
+      workspaces:
+        - name: source
+          workspace: source
+        - name: git-auth
+          workspace: git-auth
+      params:
+        - name: repo-url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+        - name: image
+          value: $(params.git-image)
+      taskSpec:
+        params:
+          - name: repo-url
+          - name: revision
+          - name: image
+        workspaces:
+          - name: source
+          - name: git-auth
+        results:
+          - name: commit
+          - name: short-commit
+        steps:
+          - name: clone
+            image: $(params.image)
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1000
+              runAsGroup: 1000
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+              seccompProfile:
+                type: RuntimeDefault
+            env:
+              - name: HOME
+                value: /tmp
+            script: |
+              #!/bin/sh
+              set -eu
+              export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'
+              # Credentials from the git-auth workspace, handed to git via GIT_ASKPASS
+              printf '#!/bin/sh\ncase "$1" in Username*) tr -d "\\n" < "%s/username";; *) tr -d "\\n" < "%s/password";; esac\n' \
+                "$(workspaces.git-auth.path)" "$(workspaces.git-auth.path)" > "$HOME/askpass.sh"
+              chmod +x "$HOME/askpass.sh"
+              export GIT_ASKPASS="$HOME/askpass.sh" GIT_TERMINAL_PROMPT=0
+              REPO="$(workspaces.source.path)/repo"
+              rm -rf "$REPO"
+              git clone --depth 1 --branch "$(params.revision)" "$(params.repo-url)" "$REPO"
+              cd "$REPO"
+              printf '%s' "$(git rev-parse HEAD)" > "$(results.commit.path)"
+              printf '%s' "$(git rev-parse --short=8 HEAD)" > "$(results.short-commit.path)"
+
+    # -------------------------------------------------------------------------
+    # 2. Build with Kaniko and push to JFrog (jfrog-repo), and mirror-repo if set
+    #    Kaniko needs no user namespace, seccomp changes or special devices, but
+    #    it runs as ROOT. That means the namespace Pod Security level must be
+    #    "baseline" (it is rejected under "restricted"). Registry credentials
+    #    come from the registry-auth workspace (.dockerconfigjson or config.json).
+    # -------------------------------------------------------------------------
+    - name: build-and-push
+      runAfter: ["git-clone"]
+      workspaces:
+        - name: source
+          workspace: source
+        - name: registry-auth
+          workspace: registry-auth
+        - name: ca-bundle
+          workspace: ca-bundle
+      params:
+        - name: skip-tls-verify
+          value: $(params.skip-tls-verify)
+        - name: image
+          value: $(params.kaniko-image)
+        - name: context
+          value: $(params.context-dir)
+        - name: dockerfile
+          value: $(params.dockerfile)
+        - name: jfrog-repo
+          value: $(params.jfrog-repo)
+        - name: mirror-repo
+          value: $(params.mirror-repo)
+        - name: image-name
+          value: $(params.image-name)
+        - name: tag
+          value: $(tasks.git-clone.results.short-commit)
+      taskSpec:
+        params:
+          - name: skip-tls-verify
+          - name: image
+          - name: context
+          - name: dockerfile
+          - name: jfrog-repo
+          - name: mirror-repo
+          - name: image-name
+          - name: tag
+        workspaces:
+          - name: source
+          - name: registry-auth
+          - name: ca-bundle
+            optional: true
+        results:
+          - name: IMAGE_DIGEST
+        steps:
+          - name: build-and-push
+            image: $(params.image)
+            securityContext:
+              runAsUser: 0
+              seccompProfile:
+                type: RuntimeDefault
+            script: |
+              #!/busybox/sh
+              set -eu
+              mkdir -p /tmp/dockercfg
+              SRC="$(workspaces.registry-auth.path)/.dockerconfigjson"
+              [ -f "$SRC" ] || SRC="$(workspaces.registry-auth.path)/config.json"
+              cp "$SRC" /tmp/dockercfg/config.json
+              export DOCKER_CONFIG=/tmp/dockercfg
+
+              # Trust an extra CA (proxy / internal registry) if one was provided
+              if [ "$(workspaces.ca-bundle.bound)" = "true" ]; then
+                cat "$(workspaces.ca-bundle.path)/ca.crt" >> /kaniko/ssl/certs/ca-certificates.crt
+              fi
+              TLS_FLAGS=""
+              if [ "$(params.skip-tls-verify)" = "true" ]; then
+                TLS_FLAGS="--skip-tls-verify --skip-tls-verify-pull"
+              fi
+
+              DEST="--destination=$(params.jfrog-repo)/$(params.image-name):$(params.tag)"
+              if [ -n "$(params.mirror-repo)" ]; then
+                DEST="$DEST --destination=$(params.mirror-repo)/$(params.image-name):$(params.tag)"
+              fi
+
+              /kaniko/executor \
+                --context="$(workspaces.source.path)/repo/$(params.context)" \
+                --dockerfile="$(workspaces.source.path)/repo/$(params.context)/$(params.dockerfile)" \
+                $DEST $TLS_FLAGS \
+                --digest-file="$(results.IMAGE_DIGEST.path)"
+
+    # -------------------------------------------------------------------------
+    # 3. Scan the pushed image (by digest) with Trivy
+    # -------------------------------------------------------------------------
+    - name: scan-image
+      runAfter: ["build-and-push"]
+      workspaces:
+        - name: registry-auth
+          workspace: registry-auth
+        - name: ca-bundle
+          workspace: ca-bundle
+      params:
+        - name: skip-tls-verify
+          value: $(params.skip-tls-verify)
+        - name: image
+          value: $(params.trivy-image)
+        - name: target
+          value: $(params.jfrog-repo)/$(params.image-name)@$(tasks.build-and-push.results.IMAGE_DIGEST)
+        - name: severity
+          value: $(params.scan-severity)
+        - name: exit-code
+          value: $(params.scan-exit-code)
+      taskSpec:
+        params:
+          - name: skip-tls-verify
+          - name: image
+          - name: target
+          - name: severity
+          - name: exit-code
+        workspaces:
+          - name: registry-auth
+          - name: ca-bundle
+            optional: true
+        steps:
+          - name: trivy
+            image: $(params.image)
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1000
+              runAsGroup: 1000
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+              seccompProfile:
+                type: RuntimeDefault
+            env:
+              - name: HOME
+                value: /tmp
+              - name: TRIVY_CACHE_DIR
+                value: /tmp/trivy-cache
+            script: |
+              #!/bin/sh
+              set -eu
+              # Trivy reads $DOCKER_CONFIG/config.json, so stage a copy of the secret there
+              mkdir -p /tmp/dockercfg
+              SRC="$(workspaces.registry-auth.path)/.dockerconfigjson"
+              [ -f "$SRC" ] || SRC="$(workspaces.registry-auth.path)/config.json"
+              cp "$SRC" /tmp/dockercfg/config.json
+              export DOCKER_CONFIG=/tmp/dockercfg
+              if [ "$(workspaces.ca-bundle.bound)" = "true" ]; then
+                cat /etc/ssl/certs/ca-certificates.crt "$(workspaces.ca-bundle.path)/ca.crt" > /tmp/ca-all.crt
+                export SSL_CERT_FILE=/tmp/ca-all.crt
+              fi
+              INSECURE=""
+              if [ "$(params.skip-tls-verify)" = "true" ]; then INSECURE="--insecure"; fi
+              exec trivy image --no-progress $INSECURE \
+                --severity="$(params.severity)" \
+                --exit-code="$(params.exit-code)" \
+                "$(params.target)"
+
+    # -------------------------------------------------------------------------
+    # 4. Update the image tag in the Helm values and push to Git
+    #    Only runs if the scan passed.
+    # -------------------------------------------------------------------------
+    - name: update-gitops
+      runAfter: ["scan-image"]
+      workspaces:
+        - name: source
+          workspace: source
+        - name: git-auth
+          workspace: git-auth
+      params:
+        - name: yq-image
+          value: $(params.yq-image)
+        - name: git-image
+          value: $(params.git-image)
+        - name: values-file
+          value: $(params.values-file)
+        - name: values-image-path
+          value: $(params.values-image-path)
+        - name: new-tag
+          value: $(tasks.git-clone.results.short-commit)
+        - name: new-digest
+          value: $(tasks.build-and-push.results.IMAGE_DIGEST)
+        - name: image-name
+          value: $(params.image-name)
+        - name: revision
+          value: $(params.revision)
+      taskSpec:
+        params:
+          - name: yq-image
+          - name: git-image
+          - name: values-file
+          - name: values-image-path
+          - name: new-tag
+          - name: new-digest
+          - name: image-name
+          - name: revision
+        workspaces:
+          - name: source
+          - name: git-auth
+        steps:
+          - name: set-image-tag
+            image: $(params.yq-image)
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1000
+              runAsGroup: 1000
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+              seccompProfile:
+                type: RuntimeDefault
+            command: ["yq"]
+            args:
+              - -i
+              - '$(params.values-image-path).tag = "$(params.new-tag)" | $(params.values-image-path).digest = "$(params.new-digest)"'
+              - $(workspaces.source.path)/repo/$(params.values-file)
+          - name: commit-and-push
+            image: $(params.git-image)
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1000
+              runAsGroup: 1000
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+              seccompProfile:
+                type: RuntimeDefault
+            env:
+              - name: HOME
+                value: /tmp
+            script: |
+              #!/bin/sh
+              set -eu
+              export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'
+              export GIT_AUTHOR_NAME="tekton-pipeline" GIT_AUTHOR_EMAIL="tekton-pipeline@sybyl.com"
+              export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+              printf '#!/bin/sh\ncase "$1" in Username*) tr -d "\\n" < "%s/username";; *) tr -d "\\n" < "%s/password";; esac\n' \
+                "$(workspaces.git-auth.path)" "$(workspaces.git-auth.path)" > "$HOME/askpass.sh"
+              chmod +x "$HOME/askpass.sh"
+              export GIT_ASKPASS="$HOME/askpass.sh" GIT_TERMINAL_PROMPT=0
+              cd "$(workspaces.source.path)/repo"
+              if git diff --quiet; then
+                echo "No change to commit."
+                exit 0
+              fi
+              git add "$(params.values-file)"
+              git commit -m "ci: update $(params.image-name) image to $(params.new-tag) $(params.new-digest) [skip ci]"
+              for i in 1 2 3; do
+                git pull --rebase origin "$(params.revision)" || true
+                if git push origin "HEAD:$(params.revision)"; then
+                  exit 0
+                fi
+                sleep 3
+              done
+              echo "Push failed after 3 attempts." >&2
+              exit 1
